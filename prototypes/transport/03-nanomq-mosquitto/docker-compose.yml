@@ -1,0 +1,114 @@
+# Throwaway prototype for issue #4: NanoMQ at the edge, Mosquitto at the hub.
+#
+# No `ports:` on purpose -- the three transport prototypes run concurrently in
+# the same working tree, so nothing may claim a host port. Every client is a
+# container attached to one of the three networks below.
+name: fl-proto-nanomq
+
+x-app: &app
+  build:
+    context: ./app
+  image: fl-proto-nanomq-app:local
+  volumes:
+    - results:/results
+  environment:
+    TOPIC: ${TOPIC:-fertloops/A4:CF:12:34:56:78/reading}
+    DEV_ID: ${DEV_ID:-A4:CF:12:34:56:78}
+    RESULTS_DIR: /results
+
+services:
+  # ---------------------------------------------------------------- hub (VPS)
+  mosquitto-hub:
+    # eclipse-mosquitto has no granular patch-version tag on Docker Hub, only
+    # rolling "2" -- pinned by digest, same digest the repo's existing sandbox
+    # (branch research/mqtt-timescaledb-bento-sandbox) uses. Resolves to 2.1.2.
+    image: eclipse-mosquitto@sha256:9cfdd46ad59f3e3e5f592f6baf57ab23e1ad00605509d0f5c1e9b179c5314d87
+    container_name: fl-proto-nanomq-hub
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - hub-data:/mosquitto/data
+    networks:
+      - link
+      - hub
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -t '$$SYS/#' -C 1 -i healthcheck -W 3 || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  # -------------------------------------------------------- edge (Raspberry Pi)
+  nanomq-edge:
+    # Set by run-experiment.sh: emqx/nanomq:latest for `defaults`,
+    # emqx/nanomq:0.25.5-slim for `hardened` (only the -slim/-full variants are
+    # built with SQLite -- confirmed empirically, see README.md).
+    image: ${NANOMQ_IMAGE:?run this through ./run-experiment.sh}
+    container_name: fl-proto-nanomq-edge
+    # Explicit --conf: without it NanoMQ logs "using default config file
+    # /usr/local/nanomq/nanomq.conf", a path that does not exist in either
+    # image, and then silently falls back to /etc/nanomq.conf. Confirmed
+    # locally. Being explicit removes the guesswork.
+    command: ["nanomq", "start", "--conf", "/etc/nanomq.conf"]
+    volumes:
+      - ./nanomq/${NANOMQ_CONF:?run this through ./run-experiment.sh}:/etc/nanomq.conf:ro
+      # bridges.mqtt.cache.mounted_file_path points here. The directory must
+      # already exist: the -slim image panics on startup ("Can't open database
+      # /nanomq/data/mqtt_client.db") if it does not. Confirmed locally.
+      - edge-data:/nanomq/data
+    networks:
+      - edge
+      - link
+
+  # --------------------------------------------------------------- experiment
+  consumer:
+    <<: *app
+    container_name: fl-proto-nanomq-consumer
+    command: ["python", "-u", "consumer.py"]
+    environment:
+      TOPIC: ${TOPIC:-fertloops/A4:CF:12:34:56:78/reading}
+      DEV_ID: ${DEV_ID:-A4:CF:12:34:56:78}
+      RESULTS_DIR: /results
+      BROKER_HOST: mosquitto-hub
+      CLIENT_ID: fl-hub-consumer
+      QOS: "1"
+    depends_on:
+      mosquitto-hub:
+        condition: service_healthy
+    networks:
+      - hub
+
+  simulator:
+    <<: *app
+    container_name: fl-proto-nanomq-simulator
+    command: ["python", "-u", "simulator.py"]
+    environment:
+      TOPIC: ${TOPIC:-fertloops/A4:CF:12:34:56:78/reading}
+      DEV_ID: ${DEV_ID:-A4:CF:12:34:56:78}
+      RESULTS_DIR: /results
+      BROKER_HOST: nanomq-edge
+      CLIENT_ID: fl-edge-simulator
+      QOS: "1"
+      RATE_PER_SECOND: ${RATE_PER_SECOND:-20}
+      RUN_SECONDS: ${RUN_SECONDS:-120}
+      MESSAGE_LIMIT: ${MESSAGE_LIMIT:-0}
+    networks:
+      - edge
+
+  verifier:
+    <<: *app
+    command: ["python", "-u", "verifier.py"]
+    environment:
+      RESULTS_DIR: /results
+      PROFILE: ${PROFILE:-unknown}
+      PHASES_JSON: ${PHASES_JSON:-[]}
+      NANOMQ_IMAGE: ${NANOMQ_IMAGE:-unknown}
+    network_mode: none
+
+networks:
+  edge:
+  link:
+  hub:
+
+volumes:
+  hub-data:
+  edge-data:
+  results:

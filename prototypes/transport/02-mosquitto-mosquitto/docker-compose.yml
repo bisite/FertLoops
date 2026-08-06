@@ -1,0 +1,107 @@
+# Throwaway prototype for issue #4: Mosquitto (edge) --bridge--> Mosquitto (hub).
+#
+# Project name is fixed so this can run at the same time as the sibling
+# prototypes without colliding on container/network names. No host ports are
+# published for the same reason: every client is a container on these networks.
+name: fl-proto-mosq
+
+services:
+  # The Raspberry Pi's broker. Sits on `edge` (simulator side) and `link`
+  # (the VPN to the VPS). Cutting `link` is what simulates the outage.
+  #
+  # eclipse-mosquitto has no granular patch-version tag (2.1.2) on Docker Hub,
+  # only rolling "2" -- pinned by digest instead so this doesn't silently
+  # change later. Currently resolves to mosquitto 2.1.2.
+  edge-broker:
+    image: eclipse-mosquitto@sha256:9cfdd46ad59f3e3e5f592f6baf57ab23e1ad00605509d0f5c1e9b179c5314d87
+    container_name: fl-proto-mosq-edge-broker
+    # Deliberately NO restart policy: phase P2 kills this container with
+    # SIGKILL and the experiment script decides when it comes back.
+    volumes:
+      - ./config/${FL_PROFILE:?set FL_PROFILE}/edge.conf:/mosquitto/config/mosquitto.conf:ro
+      - edge-data:/mosquitto/data
+    networks:
+      - edge
+      - link
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -t '$$SYS/#' -C 1 -i healthcheck -W 3 || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # The VPS broker. Sits on `link` (bridge side) and `hub` (consumer side).
+  hub-broker:
+    image: eclipse-mosquitto@sha256:9cfdd46ad59f3e3e5f592f6baf57ab23e1ad00605509d0f5c1e9b179c5314d87
+    container_name: fl-proto-mosq-hub-broker
+    volumes:
+      - ./config/${FL_PROFILE:?set FL_PROFILE}/hub.conf:/mosquitto/config/mosquitto.conf:ro
+      - hub-data:/mosquitto/data
+    networks:
+      - link
+      - hub
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_sub -t '$$SYS/#' -C 1 -i healthcheck -W 3 || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # Stands in for the Pi's UART reader: publishes ESP32 frames at 20 msg/s to
+  # the local broker and records exactly what the local broker acknowledged.
+  simulator:
+    build: .
+    image: fl-proto-mosq-client
+    container_name: fl-proto-mosq-simulator
+    command: ["/app/simulator.py"]
+    environment:
+      BROKER_HOST: edge-broker
+      RATE_HZ: "20"
+      RESULTS_DIR: /results
+    volumes:
+      - results:/results
+    networks:
+      - edge
+    depends_on:
+      edge-broker:
+        condition: service_healthy
+
+  # Stands in for whatever ingests on the VPS. Durable session, QoS 1.
+  consumer:
+    build: .
+    image: fl-proto-mosq-client
+    container_name: fl-proto-mosq-consumer
+    command: ["/app/consumer.py"]
+    environment:
+      BROKER_HOST: hub-broker
+      RESULTS_DIR: /results
+    volumes:
+      - results:/results
+    networks:
+      - hub
+    depends_on:
+      hub-broker:
+        condition: service_healthy
+
+  # Run manually at the end of the experiment (`docker compose run verifier`).
+  verifier:
+    build: .
+    image: fl-proto-mosq-client
+    command: ["/app/verifier.py"]
+    environment:
+      RESULTS_DIR: /results
+      FL_PROFILE: ${FL_PROFILE:?set FL_PROFILE}
+    volumes:
+      - results:/results
+    networks:
+      - hub
+    profiles:
+      - manual
+
+networks:
+  edge:
+  link:
+  hub:
+
+volumes:
+  edge-data:
+  hub-data:
+  results:

@@ -1,0 +1,124 @@
+# Throwaway prototype 01: native NATS end to end (no MQTT anywhere).
+#
+# Project name is pinned so this can run at the same time as the two sibling
+# prototypes without colliding on container or network names.
+name: fl-proto-nats
+
+# No `ports:` anywhere on purpose: every client is a container on these
+# networks, so three prototypes can run concurrently on the same host.
+#
+# edge  -> simulator <-> nats-leaf   (the Raspberry Pi side)
+# link  -> nats-leaf <-> nats-hub    (the VPN that goes down)
+# hub   -> nats-hub  <-> consumer    (the VPS side)
+networks:
+  edge:
+  link:
+  hub:
+
+volumes:
+  # JetStream file stores. Only used by the jetstream-mirror profile, but
+  # mounted in both so the compose file stays profile-independent.
+  leaf-store:
+  hub-store:
+  # Shared results: the simulator writes what it published, the consumer
+  # writes what arrived, the verifier reads both.
+  results:
+
+services:
+  nats-hub:
+    # 2.14.4 is the newest exact patch tag published on Docker Hub
+    # (2026-07-30). Confirmed locally: `nats-server: v2.14.4`.
+    image: nats:2.14.4-alpine
+    container_name: fl-proto-nats-hub
+    command: ["--config", "/etc/nats/hub.conf"]
+    volumes:
+      - ./nats/${HUB_CONF:?HUB_CONF must be set by run-experiment.sh}:/etc/nats/hub.conf:ro
+      - hub-store:/data
+    networks:
+      - link
+      - hub
+    healthcheck:
+      # /healthz on the monitoring port. Confirmed locally that the alpine
+      # variant ships busybox wget, so no extra tooling is needed.
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  nats-leaf:
+    image: nats:2.14.4-alpine
+    container_name: fl-proto-nats-leaf
+    command: ["--config", "/etc/nats/leaf.conf"]
+    volumes:
+      - ./nats/${LEAF_CONF:?LEAF_CONF must be set by run-experiment.sh}:/etc/nats/leaf.conf:ro
+      - leaf-store:/data
+    networks:
+      - edge
+      - link
+    depends_on:
+      nats-hub:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O- http://127.0.0.1:8222/healthz || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  consumer:
+    build: ./client
+    image: fl-proto-nats-client:1
+    container_name: fl-proto-nats-consumer
+    command: ["python", "-u", "consumer.py"]
+    environment:
+      PROFILE: ${PROFILE:?PROFILE must be set by run-experiment.sh}
+      NATS_URL: nats://nats-hub:4222
+      RESULTS_DIR: /results
+      SUBJECT_FILTER: fertloops.>
+      EDGE_DOMAIN: edge
+      HUB_DOMAIN: hub
+      EDGE_STREAM: FRAMES
+      HUB_STREAM: FRAMES_MIRROR
+      # Cap on the edge stream, in messages. Defaults to 1000 to match the
+      # Mosquitto default the sibling prototypes hit, so the three are
+      # comparable. Override with LEAF_MAX_MSGS=-1 for an uncapped run.
+      EDGE_MAX_MSGS: ${LEAF_MAX_MSGS:--1}
+    volumes:
+      - results:/results
+    networks:
+      - hub
+    depends_on:
+      nats-hub:
+        condition: service_healthy
+
+  simulator:
+    build: ./client
+    image: fl-proto-nats-client:1
+    container_name: fl-proto-nats-simulator
+    command: ["python", "-u", "simulator.py"]
+    environment:
+      PROFILE: ${PROFILE:?PROFILE must be set by run-experiment.sh}
+      NATS_URL: nats://nats-leaf:4222
+      RESULTS_DIR: /results
+      DEV_ID: "A4:CF:12:34:56:78"
+      RATE_HZ: "20"
+      EDGE_DOMAIN: edge
+      EDGE_STREAM: FRAMES
+    volumes:
+      - results:/results
+    networks:
+      - edge
+    depends_on:
+      nats-leaf:
+        condition: service_healthy
+
+  verifier:
+    build: ./client
+    image: fl-proto-nats-client:1
+    command: ["python", "-u", "verifier.py"]
+    environment:
+      PROFILE: ${PROFILE:?PROFILE must be set by run-experiment.sh}
+      RESULTS_DIR: /results
+    volumes:
+      - results:/results
+    networks:
+      - hub
