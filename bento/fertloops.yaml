@@ -1,0 +1,200 @@
+input:
+  mqtt:
+    urls: ["tcp://mosquitto:1883"]
+    client_id: "bento-fertloops"
+    topics: ["fertloops/#"]
+    qos: 1
+    # A stable client_id + clean_session:false asks Mosquitto to keep a
+    # persistent session for this consumer, so readings published while
+    # Bento is down/restarting are queued by the broker instead of lost.
+    clean_session: false
+
+pipeline:
+  processors:
+    # Pulled out as a named resource (instead of inline here) so the unit
+    # tests below can target just the validate/map/reject logic, without
+    # dedupe's cache dependency in the way. See processor_resources below.
+    - resource: validate_and_map
+    - dedupe:
+        # MQTT QoS 1 is at-least-once: the same frame can be redelivered
+        # (reconnect, unacked replay). TimescaleDB can't enforce a unique
+        # index here without including the hypertable's ingestion-time
+        # partitioning column, which differs per redelivery -- so dedupe
+        # happens here instead, keyed on dev_id + the device's own Timestamp.
+        # File-backed (not memory): confirmed by testing that a plain memory
+        # cache forgets everything on a Bento restart -- republishing an
+        # already-inserted reading right after a restart produced a second
+        # row. Persisting to /bento_data survives restarts/redeploys.
+        # Hashed: the file cache uses the key as a filename, and the device's
+        # raw Timestamp contains "/" -- confirmed by testing that using it
+        # unhashed makes Bento try (and fail) to create subdirectories.
+        # drop_on_err:false is deliberate: confirmed by testing that the
+        # default (true) makes a cache hiccup (e.g. the directory below
+        # missing) silently DROP the reading instead of just skipping dedup.
+        # Losing a real sensor reading is worse than risking an occasional
+        # duplicate, so a broken cache must fail open, not closed.
+        cache: dedupe_cache
+        key: '${! (json("dev_id") + "|" + json("raw.Timestamp")).hash("sha256").encode("hex") }'
+        drop_on_err: false
+
+processor_resources:
+  - label: validate_and_map
+    processors:
+      - try:
+          - mapping: |
+              # fertloops/# is a wildcard: anything published under it reaches
+              # this pipeline, not just sensor readings. Bloblang tolerates
+              # missing nested fields (returns null) instead of erroring, so
+              # a wrong-shaped message would otherwise sail through mapping
+              # with a null dev_id -- confirmed by testing that this then
+              # blows up two steps later inside dedupe's key interpolation,
+              # logged only at DEBUG (invisible in production) with the
+              # message silently dropped: no DB row, no fallback file, no
+              # visible error. Reject it here instead, at the boundary,
+              # where it's loud. See the unit tests at the bottom of this
+              # file (bento test bento/fertloops.yaml) for the regression
+              # coverage on this exact failure mode.
+              root = if this.devID == null || this.Data == null {
+                  throw("not a reading frame: missing devID or Data")
+                } else { this }
+
+              root.time = now().ts_format("2006-01-02T15:04:05Z07:00", "UTC")
+              root.dev_id = this.devID
+              root.ph = this.Data.pH
+              root.ce = this.Data.CE
+              root.solar = this.Data.Solar
+              root.volume = this.Data.Volume
+              root.soil_temp = this.Data.THC.T
+              root.soil_humidity = this.Data.THC.H
+              root.soil_conduct = this.Data.THC.C
+              root.air_temp = this.Data.TH.T
+              root.air_humidity = this.Data.TH.H
+              root.err_adc = this.Data.Errors.ADC
+              root.err_pulses = this.Data.Errors.Pulses
+              root.err_i2c = this.Data.Errors.I2C
+              root.err_inverter = this.Data.Errors.Inverter
+              root.err_inverter_state = this.Data.Errors.Inverter_State
+              root.valve = this.Control.Valve
+              root.inv_on = this.Control.Inv.On
+              root.inv_freq = this.Control.Inv.Freq
+              root.raw = this
+      - catch:
+          # A frame that isn't valid JSON (truncated/corrupted UART read) or
+          # doesn't look like a reading lands here instead of nacking back to
+          # MQTT forever: log once and drop it, so one bad frame can't loop
+          # endlessly or bury good frames in the log.
+          - log:
+              level: ERROR
+              message: "dropping unparseable reading: ${! error() }"
+          - mapping: "root = deleted()"
+
+cache_resources:
+  - label: dedupe_cache
+    file:
+      # Bento does NOT create this directory itself -- confirmed by testing
+      # that a fresh subdirectory here fails every cache read/write with
+      # "no such file or directory" until it exists. Pointing at the mount's
+      # root (already created by the bind mount itself, see docker-compose.yml)
+      # avoids depending on a nested folder nobody remembers to create.
+      directory: /bento_data
+
+output:
+  fallback:
+    # Primary path: insert into TimescaleDB.
+    - sql_insert:
+        driver: postgres
+        dsn: "postgres://fertloops:fertloops@timescaledb:5432/fertloops?sslmode=disable"
+        table: readings
+        columns:
+          - time
+          - dev_id
+          - ph
+          - ce
+          - solar
+          - volume
+          - soil_temp
+          - soil_humidity
+          - soil_conduct
+          - air_temp
+          - air_humidity
+          - err_adc
+          - err_pulses
+          - err_i2c
+          - err_inverter
+          - err_inverter_state
+          - valve
+          - inv_on
+          - inv_freq
+          - raw
+        args_mapping: |
+          root = [
+            this.time, this.dev_id, this.ph, this.ce, this.solar, this.volume,
+            this.soil_temp, this.soil_humidity, this.soil_conduct, this.air_temp, this.air_humidity,
+            this.err_adc, this.err_pulses, this.err_i2c, this.err_inverter, this.err_inverter_state,
+            this.valve, this.inv_on, this.inv_freq, this.raw.format_json()
+          ]
+    # Fallback: if the DB insert fails (e.g. TimescaleDB briefly down), park
+    # the reading on disk instead of nacking forever, so it isn't lost or
+    # stuck retrying indefinitely.
+    - file:
+        path: /bento_data/failed_readings.jsonl
+        codec: lines
+
+logger:
+  level: INFO
+
+# Run with: bento test bento/fertloops.yaml
+# Targets /pipeline/processors/0 (the validate_and_map resource) on purpose,
+# skipping dedupe -- dedupe needs a real cache directory to behave (see
+# cache_resources above), and none of these cases are about deduplication.
+tests:
+  - name: valid reading frame maps every field
+    target_processors: '/pipeline/processors/0'
+    input_batch:
+      - content: '{"devID":"A4:CF:12:34:56:78","Timestamp":"27/07/2026 10:52:55","Control":{"Valve":56,"Inv":{"On":1,"Freq":50}},"Data":{"pH":7,"CE":12345.67,"Solar":845.65,"Volume":20,"THC":{"T":22.55,"H":57.89,"C":1.85},"TH":{"T":22.23,"H":64.25},"Errors":{"ADC":0,"Pulses":1,"I2C":0,"Inverter":0,"Inverter_State":0}}}'
+    output_batches:
+      -
+        - json_contains: |
+            {
+              "dev_id": "A4:CF:12:34:56:78",
+              "ph": 7, "ce": 12345.67, "solar": 845.65, "volume": 20,
+              "soil_temp": 22.55, "soil_humidity": 57.89, "soil_conduct": 1.85,
+              "air_temp": 22.23, "air_humidity": 64.25,
+              "err_adc": 0, "err_pulses": 1, "err_i2c": 0, "err_inverter": 0, "err_inverter_state": 0,
+              "valve": 56, "inv_on": 1, "inv_freq": 50,
+              "raw": {"devID": "A4:CF:12:34:56:78", "Timestamp": "27/07/2026 10:52:55"}
+            }
+
+  - name: message missing devID and Data is dropped, not silently lost
+    # Regression test: this used to sail through mapping with a null dev_id
+    # (Bloblang tolerates missing nested fields) and only blow up two steps
+    # later inside dedupe's key interpolation, logged at DEBUG (invisible in
+    # production), with the message vanishing -- no DB row, no fallback file.
+    target_processors: '/pipeline/processors/0'
+    input_batch:
+      - content: '{"hello":"world"}'
+    output_batches: []
+
+  - name: message missing only Data is dropped
+    target_processors: '/pipeline/processors/0'
+    input_batch:
+      - content: '{"devID":"A4:CF:12:34:56:78"}'
+    output_batches: []
+
+  - name: non-JSON payload (corrupted UART read) is dropped, not looped
+    target_processors: '/pipeline/processors/0'
+    input_batch:
+      - content: 'not valid json {{{'
+    output_batches: []
+
+  - name: literal null payload is dropped
+    target_processors: '/pipeline/processors/0'
+    input_batch:
+      - content: 'null'
+    output_batches: []
+
+  - name: empty payload is dropped
+    target_processors: '/pipeline/processors/0'
+    input_batch:
+      - content: ''
+    output_batches: []

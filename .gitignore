@@ -1,0 +1,3 @@
+# Bento runtime state: dead-letter file + dedupe cache, regenerated locally, never commit
+bento/failed/*
+!bento/failed/.gitkeep
