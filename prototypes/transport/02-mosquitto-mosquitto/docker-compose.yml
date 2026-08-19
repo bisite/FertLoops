@@ -81,6 +81,89 @@ services:
       hub-broker:
         condition: service_healthy
 
+  # ---------------------------------------------------------------- load round
+  # Second prototype round (S1-S4): the same brokers at the real horizon --
+  # 12 drainage tables, 347 B frames, a backlog of up to 518 400 messages.
+  # Under the `load` compose profile so `up -d simulator consumer` still means
+  # the round-one outage experiment and nothing else.
+
+  # ONE client publishing to twelve topics, because the real Pi runs one reader
+  # process for all twelve ESP32s. See src/load_simulator.py.
+  load-simulator:
+    build: .
+    image: fl-proto-mosq-client
+    container_name: fl-proto-mosq-load-simulator
+    command: ["/app/load_simulator.py"]
+    environment:
+      BROKER_HOST: edge-broker
+      RESULTS_DIR: /results
+      TARGET_MSGS: ${TARGET_MSGS:-518400}
+      N_DEVICES: ${N_DEVICES:-12}
+      DRAIN_RATE_HZ: ${DRAIN_RATE_HZ:-20}
+    volumes:
+      - results:/results
+    networks:
+      - edge
+    profiles: [load]
+
+  load-consumer:
+    build: .
+    image: fl-proto-mosq-client
+    container_name: fl-proto-mosq-load-consumer
+    command: ["/app/load_consumer.py"]
+    environment:
+      BROKER_HOST: hub-broker
+      RESULTS_DIR: /results
+      CAPACITY: ${CAPACITY:-800000}
+    volumes:
+      - results:/results
+    networks:
+      - hub
+    profiles: [load]
+
+  # The Pi side of the control path: receives setpoints the VPS issued.
+  cmd-consumer:
+    build: .
+    image: fl-proto-mosq-client
+    container_name: fl-proto-mosq-cmd-consumer
+    command: ["/app/cmd_consumer.py"]
+    environment:
+      BROKER_HOST: edge-broker
+      RESULTS_DIR: /results
+    volumes:
+      - results:/results
+    networks:
+      - edge
+    profiles: [load]
+
+  # One-shot: publishes commands on the hub while the Pi is unreachable.
+  commander:
+    build: .
+    image: fl-proto-mosq-client
+    command: ["/app/commander.py"]
+    environment:
+      BROKER_HOST: hub-broker
+      RESULTS_DIR: /results
+      CMD_COUNT: ${CMD_COUNT:-60}
+      N_DEVICES: ${N_DEVICES:-12}
+    volumes:
+      - results:/results
+    networks:
+      - hub
+    profiles: [manual]
+
+  load-verifier:
+    build: .
+    image: fl-proto-mosq-client
+    command: ["/app/load_verifier.py"]
+    environment:
+      RESULTS_DIR: /results
+      MSGS_15D: ${MSGS_15D:-259200}
+      MSGS_30D: ${MSGS_30D:-518400}
+    volumes:
+      - results:/results
+    profiles: [manual]
+
   # Run manually at the end of the experiment (`docker compose run verifier`).
   verifier:
     build: .

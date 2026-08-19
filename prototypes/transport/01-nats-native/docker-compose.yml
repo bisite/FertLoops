@@ -111,6 +111,62 @@ services:
       nats-leaf:
         condition: service_healthy
 
+  # ---------------------------------------------------------------- load round
+  # Second prototype round: the same leaf/hub JetStream topology at the real
+  # horizon. Behind a compose profile so `up -d simulator consumer` still means
+  # the round-one outage experiment.
+  load-simulator:
+    build: ./client
+    image: fl-proto-nats-client:1
+    container_name: fl-proto-nats-load-simulator
+    command: ["python", "-u", "load_simulator.py"]
+    environment:
+      NATS_URL: nats://nats-leaf:4222
+      RESULTS_DIR: /results
+      TARGET_MSGS: ${TARGET_MSGS:-518400}
+      N_DEVICES: ${N_DEVICES:-12}
+      DRAIN_RATE_HZ: ${DRAIN_RATE_HZ:-20}
+      EDGE_DOMAIN: edge
+      EDGE_STREAM: FRAMES
+      SUBJECT_FILTER: fertloops.>
+    volumes:
+      - results:/results
+    networks:
+      - edge
+    profiles: [load]
+
+  load-consumer:
+    build: ./client
+    image: fl-proto-nats-client:1
+    container_name: fl-proto-nats-load-consumer
+    command: ["python", "-u", "load_consumer.py"]
+    environment:
+      NATS_URL: nats://nats-hub:4222
+      RESULTS_DIR: /results
+      SUBJECT_FILTER: fertloops.>
+      EDGE_DOMAIN: edge
+      HUB_DOMAIN: hub
+      EDGE_STREAM: FRAMES
+      HUB_STREAM: FRAMES_MIRROR
+      CAPACITY: ${CAPACITY:-800000}
+    volumes:
+      - results:/results
+    networks:
+      - hub
+    profiles: [load]
+
+  load-verifier:
+    build: ./client
+    image: fl-proto-nats-client:1
+    command: ["python", "-u", "load_verifier.py"]
+    environment:
+      RESULTS_DIR: /results
+      MSGS_15D: ${MSGS_15D:-259200}
+      MSGS_30D: ${MSGS_30D:-518400}
+    volumes:
+      - results:/results
+    profiles: [manual]
+
   verifier:
     build: ./client
     image: fl-proto-nats-client:1
