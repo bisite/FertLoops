@@ -1,0 +1,21 @@
+-- TimescaleDB Toolkit: a separate extension from `timescaledb` itself,
+-- unlocking hyperfunctions this schema's IoT readings can benefit from —
+-- time-weighted averages for irregularly-sampled sensors and
+-- LTTB downsampling for charting (see QUERIES.md in this directory) —
+-- without needing anything change about the table shape.
+--
+-- Optional, opt-in per project (docs/adr/0004,
+-- docs/adr/0010-toolkit-layer-and-tiering-exclusion.md).
+-- Independent golang-migrate source (docs/adr/0008) from both `core`
+-- and `timescaledb` — apply it with its own -database
+-- x-migrations-table, after 000001_reading_hypertable has run (Toolkit
+-- assumes a hypertable already exists, though it doesn't strictly
+-- require one).
+--
+-- Unlike `timescaledb`, the toolkit's shared library is not always
+-- bundled with a self-hosted TimescaleDB install — it may need a
+-- separate OS package/build step first (see the TigerData docs' "Install
+-- TimescaleDB Toolkit" page). CREATE EXTENSION fails if that step hasn't
+-- been done; that's expected, not a bug in this migration.
+
+CREATE EXTENSION IF NOT EXISTS timescaledb_toolkit;

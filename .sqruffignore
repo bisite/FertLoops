@@ -1,0 +1,5 @@
+# TimescaleDB extension DDL (create_hypertable() WITH-clause options like
+# `WITH (timescaledb.continuous)`, ALTER TABLE ... SET (timescaledb.*)) is
+# not plain SQL and fails to parse under sqruff's postgres dialect. The
+# extension layers get human review only — see docs/adr/0009.
+db/migrations/extensions/

@@ -1,0 +1,22 @@
+# sqruff (playground.quary.dev) — SQL linter for db/migrations/core and
+# db/migrations/seed, which are plain PostgreSQL.
+# db/migrations/extensions is excluded (see .sqruffignore): its TimescaleDB
+# DDL isn't parseable by a plain postgres grammar.
+#
+# Run it with `uvx sqruff lint .` from the repo root. No CI gate yet — that
+# is part of https://github.com/bisite/FertLoops/issues/16.
+[sqruff]
+dialect = postgres
+
+# LT01 (spacing) and LT02 (indent) fight this schema's deliberate style —
+# LT01 false-positives on the required space in `FOREIGN KEY (col)`, and
+# LT02's fixer flattens hanging-indent WHERE/AND continuations and
+# subquery indentation (e.g. inside NOT EXISTS (...)) rather than
+# preserving them. Every other rule (capitalisation, ambiguous
+# constructs, references, structure, convention) applies normally.
+exclude_rules = LT01,LT02
+
+# The SQL comments wrap prose at ~80 cols like the rest of the codebase
+# (docs/, migration headers) but occasionally run a bit past it; 100 gives
+# headroom without being a no-op.
+max_line_length = 100
