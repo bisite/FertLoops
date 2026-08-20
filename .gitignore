@@ -1,0 +1,21 @@
+# Local environment / secrets — never commit connection strings or creds.
+# The real .env lives only on the VPS (docs/adr/0003); the repo carries
+# only .env.example, with keys and no values.
+.env
+.env.*
+!.env.example
+*.local
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Claude Code local settings (machine/user-specific harness files)
+.claude/settings.local.json
+.claude/**/*.tmp.*
