@@ -14,6 +14,22 @@ datos como etiqueta de compilación** o todas las órdenes fallan con
 go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@v4.19.0
 ```
 
+## Levantar una base de datos para trabajar
+
+Para desarrollo o para probar una migración, un contenedor desechable basta.
+La imagen es la que fija docs/adr/0001, y **la etiqueta importa**: una
+variante `-oss` no trae la edición Community y estas migraciones fallan a
+medio aplicar (ver «Cómo se comprobó esto» al final).
+
+```sh
+docker run -d --name fertloops-db \
+  -e POSTGRES_PASSWORD=... -e POSTGRES_DB=fertloops -p 5432:5432 \
+  timescale/timescaledb-ha:pg18
+```
+
+El despliegue real no se hace así, sino con Docker Compose y escuchando solo
+en `127.0.0.1` (docs/adr/0003).
+
 ## Disposición
 
 - `db/migrations/core/` — obligatoria. Las tablas del dominio: dispositivos,
